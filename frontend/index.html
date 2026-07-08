@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Agent-Aware Pro</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .fade-in { animation: fade .35s ease both; } @keyframes fade { from {opacity:0;transform:translateY(6px);} to {opacity:1;transform:none;} }
+  .spin { animation: sp 1s linear infinite; } @keyframes sp { to { transform: rotate(360deg);} }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+<div class="max-w-6xl mx-auto px-5 py-8">
+
+  <header class="flex items-center justify-between mb-6">
+    <div class="flex items-center gap-2">
+      <div class="w-7 h-7 rounded-lg bg-indigo-600"></div>
+      <div><h1 class="text-lg font-semibold leading-none">Agent-Aware <span class="text-indigo-600">Pro</span></h1>
+        <p class="text-xs text-slate-400 mt-1">Structured multi-source search · grounded recommendations</p></div>
+    </div>
+    <div class="flex items-center gap-3">
+      <button id="slackBtn" class="text-xs px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:border-indigo-300">💬 Slack</button>
+      <div id="health" class="text-xs text-slate-400"></div>
+    </div>
+  </header>
+
+  <form id="form" class="flex gap-2 mb-3">
+    <input id="q" autocomplete="off"
+      class="flex-1 px-4 py-3 rounded-xl border border-slate-200 bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+      placeholder='Try: "flights Mumbai to Delhi", "iPhone 15 price", "hotels in Goa"'/>
+    <button class="px-5 py-3 rounded-xl bg-indigo-600 text-white font-medium hover:bg-indigo-700 transition">Search</button>
+  </form>
+  <div id="chips" class="flex flex-wrap gap-2 mb-6 text-sm"></div>
+
+  <div class="grid lg:grid-cols-3 gap-5">
+    <div class="lg:col-span-2">
+      <div id="status" class="hidden mb-4"></div>
+      <div id="intent" class="mb-4"></div>
+      <div id="rec" class="mb-5"></div>
+      <div id="offers" class="grid sm:grid-cols-2 gap-3"></div>
+    </div>
+
+    <!-- Evals / diagnostics + source recovery -->
+    <aside>
+      <div class="rounded-2xl border border-slate-200 bg-white p-4 sticky top-6">
+        <div class="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-3">⚙️ Evals &amp; sources</div>
+        <div id="checklist" class="space-y-1.5 mb-3 text-sm"></div>
+        <div id="srcHealth" class="space-y-2"></div>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<!-- Slack drawer -->
+<div id="slackPanel" class="hidden fixed inset-y-0 right-0 w-80 bg-white border-l border-slate-200 shadow-xl p-4 overflow-y-auto z-20">
+  <div class="flex items-center justify-between mb-3">
+    <div class="text-sm font-semibold">💬 Slack <span id="slackTeam" class="text-slate-400 font-normal"></span></div>
+    <button id="slackClose" class="text-slate-400 hover:text-slate-700">✕</button>
+  </div>
+  <div id="slackBody" class="text-sm text-slate-500">Loading…</div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const EXAMPLES = ["flights Mumbai to Delhi", "iPhone 15 price", "hotels in Goa", "Bangalore to Hyderabad flights"];
+let recWinner = null, lastQuery = "", srcState = {};
+
+function el(h){ const d=document.createElement('div'); d.innerHTML=h.trim(); return d.firstChild; }
+function money(p){ if(!p) return ''; const s={INR:'₹',USD:'$',EUR:'€',GBP:'£'}[p.currency]||''; return s+Math.round(p.amount).toLocaleString(); }
+function chip(t){ const b=document.createElement('button'); b.className="px-3 py-1.5 rounded-full bg-white border border-slate-200 hover:border-indigo-300 text-slate-600"; b.textContent=t; b.onclick=()=>{$('#q').value=t; run(t);}; return b; }
+EXAMPLES.forEach(e=>$('#chips').appendChild(chip(e)));
+
+fetch('/api/health').then(r=>r.json()).then(h=>{
+  const live=h.sources.filter(s=>s.mode==='live').length;
+  $('#health').textContent=`${live} live · ${h.sources.length-live} demo${h.llm_configured?' · AI on':''}`;
+});
+
+$('#form').onsubmit=e=>{e.preventDefault(); run($('#q').value.trim());};
+
+// ── Evals checklist ──
+function setChecklist(stage){
+  const steps=[["intent","Understood query"],["sources","Searched sources"],["rec","Ranked & recommended"]];
+  $('#checklist').innerHTML=steps.map(([k,label])=>{
+    const on=stage[k]; const mark=on?'<span class="text-emerald-600">✓</span>':'<span class="text-slate-300">○</span>';
+    return `<div class="flex items-center gap-2 ${on?'text-slate-700':'text-slate-400'}">${mark} ${label}</div>`;
+  }).join('');
+}
+let stage={intent:false,sources:false,rec:false};
+
+function renderSrcHealth(){
+  $('#srcHealth').innerHTML=Object.values(srcState).map(s=>{
+    const badge=s.live?'<span class="px-1.5 rounded bg-emerald-600 text-white text-[10px]">LIVE</span>':'<span class="px-1.5 rounded bg-slate-300 text-slate-700 text-[10px]">DEMO</span>';
+    const st=s.status==='ok'?`<span class="text-emerald-600">✓ ${s.offers.length}</span>`
+      :s.status==='empty'?'<span class="text-slate-400">empty</span>':`<span class="text-rose-600">✗ ${s.status}</span>`;
+    const retry=(s.status!=='ok')?`<button data-src="${s.source}" class="retryBtn mt-1 text-xs text-indigo-600 hover:underline">↻ retry this source</button>`:'';
+    const err=s.error?`<div class="text-[11px] text-rose-500 mt-0.5 font-mono">${s.error.slice(0,80)}</div>`:'';
+    return `<div class="rounded-lg border border-slate-100 bg-slate-50 p-2 text-xs">
+      <div class="flex items-center justify-between"><span class="font-medium text-slate-700">${s.source_name} ${badge}</span>${st}</div>
+      <div class="text-slate-400">${s.latency_ms}ms</div>${err}${retry}</div>`;
+  }).join('');
+  $('#srcHealth').querySelectorAll('.retryBtn').forEach(b=>b.onclick=()=>retrySource(b.dataset.src));
+}
+
+async function retrySource(source){
+  const r=await fetch('/api/source/retry',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({source, query:lastQuery})});
+  const res=await r.json(); if(res.source){ srcState[source]=res; renderSrcHealth(); }
+}
+
+function run(q){
+  if(!q) return; lastQuery=q; recWinner=null; srcState={}; stage={intent:false,sources:false,rec:false};
+  ['intent','rec','offers','srcHealth'].forEach(id=>$('#'+id).innerHTML=''); setChecklist(stage);
+  const st=$('#status'); st.className="mb-4 flex items-center gap-2 text-sm text-slate-500";
+  st.innerHTML=`<svg class="spin w-4 h-4 text-indigo-500" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" stroke-dasharray="40 60" stroke-linecap="round"/></svg> Searching sources in parallel…`;
+  const es=new EventSource('/api/search/stream?q='+encodeURIComponent(q));
+
+  es.addEventListener('intent',ev=>{
+    const it=JSON.parse(ev.data); stage.intent=true; setChecklist(stage);
+    const params=Object.entries(it.params||{}).map(([k,v])=>`<span class="px-2 py-0.5 rounded bg-slate-100 text-slate-600">${v}</span>`).join(' ');
+    $('#intent').innerHTML=`<div class="fade-in flex items-center gap-2 text-sm"><span class="px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-700 font-medium uppercase tracking-wide text-xs">${it.category}</span>${params}</div>`;
+    if(it.clarification){ st.innerHTML=`<span class="text-amber-600">💬 ${it.clarification}</span>`; es.close(); }
+  });
+  es.addEventListener('source',ev=>{ const s=JSON.parse(ev.data); srcState[s.source]=s; stage.sources=true; setChecklist(stage); renderSrcHealth(); });
+  es.addEventListener('recommendation',ev=>{
+    const d=JSON.parse(ev.data); stage.rec=true; setChecklist(stage);
+    if(d.recommendation){ const r=d.recommendation; recWinner=r.winner_id;
+      const conf={high:'bg-emerald-100 text-emerald-700',medium:'bg-amber-100 text-amber-700',low:'bg-slate-100 text-slate-600'}[r.confidence]||'';
+      const tos=(r.trade_offs||[]).map(t=>`<li class="text-sm text-slate-600">• ${t}</li>`).join('');
+      $('#rec').innerHTML=`<div class="fade-in rounded-2xl border border-indigo-200 bg-gradient-to-br from-indigo-50 to-white p-5">
+        <div class="flex items-center justify-between mb-1"><span class="text-xs font-semibold uppercase tracking-wide text-indigo-600">⬡ Best pick</span>
+        <span class="text-xs px-2 py-0.5 rounded-full ${conf}">${r.confidence} confidence</span></div>
+        <div class="text-lg font-semibold">${r.headline||''}</div><p class="text-sm text-slate-600 mt-1">${r.reasoning||''}</p>
+        <ul class="mt-2">${tos}</ul></div>`; }
+    renderOffers(d.offers||[]);
+  });
+  es.addEventListener('done',()=>{ st.className="hidden"; es.close();
+    if(!$('#offers').children.length) $('#offers').innerHTML='<div class="text-sm text-slate-400 p-4">No results — try another query.</div>'; });
+  es.onerror=()=>{ st.className="hidden"; es.close(); };
+}
+
+function fmt(k,v){ if(k==='duration_minutes'&&v) return Math.floor(v/60)+'h '+(v%60)+'m'; if(k==='stops') return v===0?'Non-stop':v+' stop'; return v; }
+function labelize(k){ return k.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase()); }
+function renderOffers(offers){
+  const wrap=$('#offers'); wrap.innerHTML='';
+  offers.forEach(o=>{ const win=o.id===recWinner;
+    const attrs=Object.entries(o.attributes||{}).filter(([k,v])=>v!==null&&v!==''&&!Array.isArray(v)).slice(0,4)
+      .map(([k,v])=>`<span class="px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 text-xs">${labelize(k)}: ${fmt(k,v)}</span>`).join(' ');
+    const link=o.url?`<a href="${o.url}" target="_blank" class="text-indigo-600 text-sm font-medium">See it →</a>`:'';
+    wrap.appendChild(el(`<div class="fade-in rounded-xl border ${win?'border-indigo-400 ring-1 ring-indigo-200':'border-slate-200'} bg-white p-4">
+      <div class="flex items-start justify-between gap-2"><div><div class="font-medium leading-tight">${o.title} ${win?'<span class="text-indigo-600 text-xs">★ best</span>':''}</div>
+        <div class="text-xs text-slate-400 mt-0.5">${o.source_name}</div></div><div class="text-lg font-semibold whitespace-nowrap">${money(o.price)}</div></div>
+      <div class="flex flex-wrap gap-1 mt-2">${attrs}</div><div class="mt-2">${link}</div></div>`)); });
+}
+
+// ── Slack drawer ──
+$('#slackBtn').onclick=openSlack; $('#slackClose').onclick=()=>$('#slackPanel').classList.add('hidden');
+async function openSlack(){
+  $('#slackPanel').classList.remove('hidden'); const body=$('#slackBody'); body.innerHTML='Loading…';
+  const stt=await (await fetch('/api/slack/status')).json();
+  if(!stt.configured){ body.innerHTML='<div class="text-slate-400">Slack not configured (set SLACK_BOT_TOKEN).</div>'; return; }
+  $('#slackTeam').textContent=stt.team?('· '+stt.team):'';
+  const ch=await (await fetch('/api/slack/channels')).json();
+  if(!ch.ok){ body.innerHTML=`<div class="text-rose-500">${ch.error}</div>`; return; }
+  body.innerHTML=ch.channels.map(c=>`<button data-id="${c.id}" data-name="${c.name}" class="chBtn w-full text-left px-2 py-1.5 rounded hover:bg-slate-100 flex justify-between">
+    <span># ${c.name}</span><span class="text-slate-400 text-xs">${c.num_members||''}</span></button>`).join('');
+  body.querySelectorAll('.chBtn').forEach(b=>b.onclick=()=>viewChannel(b.dataset.id,b.dataset.name));
+}
+async function viewChannel(id,name){
+  const body=$('#slackBody'); body.innerHTML=`<button id="back" class="text-indigo-600 text-xs mb-2">← channels</button><div class="font-medium mb-2"># ${name}</div><div class="text-slate-400">Loading…</div>`;
+  $('#back').onclick=openSlack;
+  const m=await (await fetch('/api/slack/messages?channel='+id)).json();
+  const list=$('#slackBody'); const head=`<button id="back2" class="text-indigo-600 text-xs mb-2">← channels</button><div class="font-medium mb-2"># ${name}</div>`;
+  if(!m.ok){ list.innerHTML=head+`<div class="text-rose-500 text-xs">${m.error}${m.error==='not_in_channel'?' — invite the bot to this channel':''}</div>`; }
+  else if(!m.messages.length){ list.innerHTML=head+'<div class="text-slate-400 text-xs">No recent messages.</div>'; }
+  else { list.innerHTML=head+m.messages.map(x=>`<div class="mb-2"><div class="text-xs font-medium text-slate-700">${x.author}</div><div class="text-xs text-slate-600">${(x.text||'').replace(/</g,'&lt;')}</div></div>`).join(''); }
+  document.getElementById('back2')&&(document.getElementById('back2').onclick=openSlack);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+# ── Secrets & credentials — NEVER commit ──
+.env
+*.env
+.env.*
+!.env.example
+
+# ── Logs & runtime artifacts ──
+*.log
+.run.log
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# ── Data / cache ──
+*.db
+*.sqlite3
+.cache/
+
+# ── OS / editor ──
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
