@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Offline tests (redaction, self-correction — no API keys needed)
+        run: pytest tests/test_redaction.py tests/test_self_correction.py -v
+
+      # No `if: secrets...` gate — GitHub Actions rejects the `secrets` context inside
+      # an `if:` condition directly ("Unrecognized named-value: 'secrets'"). The test
+      # itself self-skips via pytestmark when no key is configured.
+      - name: Live prompt-injection defense test (real Gemini call; self-skips without a key)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+        run: pytest tests/test_prompt_injection_live.py -v -s

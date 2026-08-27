@@ -12,6 +12,7 @@ import json
 
 from .llm import complete_json
 from .schema import Intent, Offer, Recommendation
+from .security.redact import wrap_untrusted, detect_injection, redact_pii
 
 _SYSTEM = """You are a sharp, honest comparison advisor. You are given a JSON list of
 real offers (each with an id, price and attributes) for the user's search. Pick the best
@@ -25,10 +26,14 @@ Return JSON: {"winner_id","headline","reasoning","trade_offs":["..."],"confidenc
 
 
 def _compact(offers: list[Offer]) -> str:
+    # title/attributes come from supplier data — anyone who can list an offer (a hotel
+    # owner, a seller) controls this free text. Redact PII before it goes anywhere near
+    # a prompt or gets echoed back through the API.
     return json.dumps([
-        {"id": o.id, "source": o.source_name, "title": o.title,
+        {"id": o.id, "source": o.source_name, "title": redact_pii(o.title)[0],
          "price": o.price.amount if o.price else None,
-         **{k: v for k, v in o.attributes.items() if v not in (None, "")}}
+         **{k: (redact_pii(v)[0] if isinstance(v, str) else v)
+            for k, v in o.attributes.items() if v not in (None, "")}}
         for o in offers[:12]
     ], default=str)
 
@@ -38,18 +43,30 @@ async def recommend(intent: Intent, offers: list[Offer]) -> Recommendation | Non
         return None
 
     valid_ids = {o.id for o in offers}
+    # Offer titles/attributes are untrusted (supplier-listed free text) — fence them so
+    # the model treats them as data, not instructions. This is defense-in-depth: the
+    # REAL backstop is the winner_id membership check below, which can't be bypassed by
+    # any prompt content because it validates against the actual offer set, not the
+    # LLM's claim.
     user = (f'Search: "{intent.raw_query}" (category: {intent.category.value})\n'
-            f"Offers:\n{_compact(offers)}")
+            f"Offers:\n{wrap_untrusted(_compact(offers), source='supplier offer data')}")
     data = await complete_json(_SYSTEM, user, max_tokens=700)
 
     if data and data.get("winner_id") in valid_ids:
-        return Recommendation(
-            winner_id=data["winner_id"],
-            headline=str(data.get("headline", ""))[:160],
-            reasoning=str(data.get("reasoning", ""))[:600],
-            trade_offs=[str(t)[:160] for t in (data.get("trade_offs") or [])][:4],
-            confidence=str(data.get("confidence", "medium")).lower(),
-        )
+        text_fields = " ".join(str(data.get(f, "")) for f in ("headline", "reasoning")) \
+            + " ".join(str(t) for t in (data.get("trade_offs") or []))
+        injected = detect_injection(text_fields)
+        if not injected:
+            return Recommendation(
+                winner_id=data["winner_id"],
+                headline=str(data.get("headline", ""))[:160],
+                reasoning=str(data.get("reasoning", ""))[:600],
+                trade_offs=[str(t)[:160] for t in (data.get("trade_offs") or [])][:4],
+                confidence=str(data.get("confidence", "medium")).lower(),
+            )
+        # The LLM's own output text carries injection-shaped phrasing — something got
+        # through the fence. Don't show it to the user; fall through to the
+        # deterministic pick below instead of trusting a possibly-steered explanation.
 
     # Deterministic fallback — cheapest priced offer, truthful templated explanation.
     priced = [o for o in offers if o.price]

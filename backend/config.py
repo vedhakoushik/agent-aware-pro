@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     # ── LLM providers (the reasoning layer — NOT data fetching) ──
     groq_api_key: str = ""
     gemini_api_key: str = ""
+    gemini_api_keys: str = ""   # comma-separated pool — rotates so one free-tier key
+                                # exhausting its quota mid-run doesn't stall reasoning
     ollama_enabled: bool = False
     ollama_model: str = "qwen2.5:7b"
     ollama_base_url: str = "http://localhost:11434/v1"
